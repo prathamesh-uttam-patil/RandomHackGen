@@ -82,51 +82,6 @@ Language hint: ${langHint}`
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })
-
-    // ALTERNATIVE: Claude API (commented out)
-    /*
-    const anthropicApiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
-    
-    if (!anthropicApiKey) {
-      throw new Error('VITE_ANTHROPIC_API_KEY is not set')
-    }
-
-    const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-3-haiku-20240307',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: modelPrompt,
-          },
-        ],
-      }),
-    })
-
-    if (!claudeResponse.ok) {
-      const errorText = await claudeResponse.text()
-      throw new Error(`Claude API error: ${claudeResponse.status} - ${errorText}`)
-    }
-
-    const claudeData = await claudeResponse.json()
-    const content = claudeData.content?.[0]?.text
-
-    if (!content) {
-      throw new Error('No content received from Claude')
-    }
-
-    return new Response(JSON.stringify({ content }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    })
-    */
   } catch (error) {
     console.error('API error:', error)
     return new Response(
