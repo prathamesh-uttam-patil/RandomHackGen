@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  @apply bg-white text-zinc-800 dark:bg-zinc-900 dark:text-zinc-100;
+}
+
+/* fixed gradient layer behind everything */
+.bg-page-gradient {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(900px 600px at 20% 10%, rgba(147,197,253,0.35), transparent 60%),
+    radial-gradient(900px 600px at 80% 15%, rgba(244,114,182,0.30), transparent 60%),
+    radial-gradient(700px 500px at 50% 80%, rgba(196,181,253,0.25), transparent 55%);
+  pointer-events: none;
+}
+
+/* readable card defaults */
+.card {
+  @apply rounded-2xl bg-white dark:bg-zinc-800 border border-zinc-100/70 dark:border-white/10 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.15)];
+}
+
+.card-title {
+  @apply text-zinc-900 dark:text-white font-semibold;
+}
+
+.card-text {
+  @apply text-zinc-700 dark:text-zinc-200;
+}
+
+/* hide any accidental duplicate generate areas */
+.hidden-once {
+  display: none !important;
+}
+

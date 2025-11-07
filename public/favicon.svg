@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Lightbulb outline -->
+  <path d="M 50 15 Q 35 15 25 25 Q 20 30 20 40 Q 20 50 25 55 L 30 60 L 30 70 L 35 75 L 35 80 L 40 82 L 40 85 L 45 87 L 45 90 L 50 92 L 55 90 L 55 87 L 60 85 L 60 82 L 65 80 L 65 75 L 70 70 L 70 60 L 75 55 Q 80 50 80 40 Q 80 30 75 25 Q 65 15 50 15 Z" 
+        fill="none" 
+        stroke="#00ff88" 
+        stroke-width="3" 
+        filter="url(#glow)"/>
+  <!-- Base threads -->
+  <line x1="40" y1="82" x2="40" y2="85" stroke="#00ff88" stroke-width="2" filter="url(#glow)"/>
+  <line x1="50" y1="82" x2="50" y2="85" stroke="#00ff88" stroke-width="2" filter="url(#glow)"/>
+  <line x1="60" y1="82" x2="60" y2="85" stroke="#00ff88" stroke-width="2" filter="url(#glow)"/>
+  <!-- Base cap -->
+  <ellipse cx="50" cy="87" rx="8" ry="2" fill="none" stroke="#00ff88" stroke-width="2" filter="url(#glow)"/>
+  <!-- Lightning bolt inside -->
+  <path d="M 50 30 L 45 45 L 48 45 L 42 65 L 50 50 L 47 50 L 53 30 Z" 
+        fill="none" 
+        stroke="#00ff88" 
+        stroke-width="3" 
+        stroke-linejoin="round" 
+        stroke-linecap="round"
+        filter="url(#glow)"/>
+</svg>
+
