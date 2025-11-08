@@ -2,12 +2,6 @@
 
 import { stripJsonFences, detectLanguage, tryParseJson } from "./jsonUtils";
 
-/**
- * Generate a hack by calling /api/hack (Edge Function).
- *
- * @param {string} prompt
- * @param {number} timeout   client-side timeout
- */
 export async function generateHack(prompt = "", timeout = 20000) {
   const langHint = prompt ? detectLanguage(prompt) : "en";
 
@@ -15,7 +9,7 @@ export async function generateHack(prompt = "", timeout = 20000) {
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch("/api/hack", {
+    const res = await fetch("/api/hack", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
@@ -27,57 +21,45 @@ export async function generateHack(prompt = "", timeout = 20000) {
 
     clearTimeout(timer);
 
-    if (!response.ok) {
+    if (!res.ok) {
       let err = null;
       try {
-        err = await response.json();
+        err = await res.json();
       } catch {}
-      throw new Error(err?.error || `HTTP ${response.status}`);
+      throw new Error(err?.error || `HTTP ${res.status}`);
     }
 
-    const data = await response.json();
+    const data = await res.json();
 
-    // Edge API returns: { title, description, ... } directly ✅
-    if (data.title) {
-      return normalizeHack(data);
-    }
+    // If API already returns JSON → direct
+    if (data.title) return normalizeHack(data);
 
-    // If somehow it returns {content: "...json..."}
+    // else parse "content"
     const raw = data.content || data;
     const cleaned = typeof raw === "string" ? stripJsonFences(raw) : raw;
-    const parsed = typeof cleaned === "string" ? tryParseJson(cleaned) : cleaned;
+
+    const parsed =
+      typeof cleaned === "string" ? tryParseJson(cleaned) : cleaned;
 
     return normalizeHack(parsed);
   } catch (err) {
-    if (err.name === "AbortError") {
-      throw new Error("Request timed out");
-    }
-    console.error("generateHack error:", err);
+    if (err.name === "AbortError") throw new Error("Request timed out");
     throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-/* ---------- sanitize hack object ---------- */
-
 function normalizeHack(h) {
   const obj = {
-    title: h.title || "",
-    description: h.description || "",
-    category: h.category || "misc",
-    difficulty: h.difficulty || "Easy",
-    usefulness: clamp(useNumber(h.usefulness), 0, 100),
-    bonus: h.bonus || "",
+    title: (h.title || "").trim(),
+    description: (h.description || "").trim(),
+    category: (h.category || "misc").trim(),
+    difficulty: (h.difficulty || "Easy").trim(),
+    usefulness: clamp(toNum(h.usefulness), 0, 100),
+    bonus: (h.bonus || "").trim(),
   };
 
-  // cleanup
-  obj.title = String(obj.title).trim();
-  obj.description = String(obj.description).trim();
-  obj.category = String(obj.category).trim();
-  obj.bonus = String(obj.bonus).trim();
-
-  // difficulty
   const d = obj.difficulty.toLowerCase();
   if (d.includes("adv")) obj.difficulty = "Advanced";
   else if (d.includes("med")) obj.difficulty = "Medium";
@@ -86,9 +68,9 @@ function normalizeHack(h) {
   return obj;
 }
 
-function useNumber(x) {
-  if (typeof x === "number") return x;
-  const m = String(x).match(/\d+/);
+function toNum(n) {
+  if (typeof n === "number") return n;
+  const m = String(n).match(/\d+/);
   return m ? Number(m[0]) : 50;
 }
 
