@@ -7,21 +7,28 @@ export default async function handler() {
 
   const bases = ["v1beta", "v1"];
   const out = [];
+
   for (const base of bases) {
     const url = `https://generativelanguage.googleapis.com/${base}/models?key=${key}`;
     const r = await fetch(url);
-    let j = null;
-    try { j = await r.json(); } catch {}
+    const text = await r.text().catch(() => "");
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch {}
+
     out.push({
       base,
       status: r.status,
-      count: Array.isArray(j?.models) ? j.models.length : 0,
-      models: (j?.models || []).map(m => ({
-        name: m.name, // e.g. "models/gemini-1.5-flash-latest"
-        methods: m.supportedGenerationMethods,
-      })),
+      ok: r.ok,
+      raw: parsed ?? text, // show whatever we got
+      models: Array.isArray(parsed?.models)
+        ? parsed.models.map(m => ({
+            name: m.name,
+            methods: m.supportedGenerationMethods
+          }))
+        : null,
     });
   }
+
   return json({ discovered: out });
 }
 
