@@ -1,24 +1,20 @@
 // FILE: api/hack.js
 /**
- * Edge function for Random Hack Generator
- * - Forces JSON output via generationConfig.responseMimeType = "application/json"
- * - Robust parsing & diagnostics
- * - Times out upstream after 20s to avoid Vercel kills
- * - Sends helpful headers: X-Gemini-Base, X-Gemini-Model
+ * Random Hack Generator — Gemini Edge API
  *
- * Prereq: Set server-side env var on Vercel → GEMINI_API_KEY
+ * Fixes:
+ * - Forces JSON via responseMimeType
+ * - Uses concise instructions to reduce prompt tokens
+ * - Starts with medium maxOutputTokens, auto-retries with higher cap if finishReason=MAX_TOKENS or no text
+ * - Robust parsing + diagnostics
  */
 
 export const config = { runtime: "edge" };
 
 export default async function handler(req) {
   // CORS / Preflight
-  if (req.method === "OPTIONS") {
-    return withCORS(new Response(null, { status: 204 }));
-  }
-  if (req.method !== "POST") {
-    return withCORS(json({ error: "Method not allowed" }, 405));
-  }
+  if (req.method === "OPTIONS") return withCORS(new Response(null, { status: 204 }));
+  if (req.method !== "POST") return withCORS(json({ error: "Method not allowed" }, 405));
 
   const key = process.env.GEMINI_API_KEY;
   if (!key) return withCORS(json({ error: "Missing GEMINI_API_KEY on server" }, 500));
@@ -27,131 +23,121 @@ export default async function handler(req) {
   try { body = await req.json(); } catch {}
   const { prompt = "random useful hack for anyone", langHint = "auto" } = body;
 
-  // Short, strict instruction
-  const systemInstruction = [
-    "You generate a single clever, unique, practical hack.",
-    "Detect the user's input language; if Marathi then respond fully in Marathi; if English then in English.",
-    "Mirror the dominant language. Do NOT translate unless asked.",
-    "Return ONLY strict JSON, no markdown, no extra text."
-  ].join(" ");
+  // Extremely concise instructions (short = fewer prompt tokens)
+  const systemInstruction = "Reply ONLY JSON for one practical hack. If input Marathi, reply Marathi; else English.";
+  const userInstruction = buildUserPrompt(prompt, langHint);
 
-  // Force JSON response from Gemini
-  const generationConfig = {
-    temperature: 0.7,
-    maxOutputTokens: 400,
-    responseMimeType: "application/json"
-  };
-
-  // Prefer models that are actually available per your headers:
-  // You already saw: v1beta/models/gemini-flash-latest ⇒ modelVersion: gemini-2.5-flash-preview-09-2025
+  // Prefer the model you actually hit in headers earlier:
+  //   v1beta/models/gemini-flash-latest  (maps to 2.5 flash preview)
   const BASES = ["v1beta", "v1"];
-  const MODELS = [
-    "models/gemini-flash-latest",          // maps to 2.5 flash preview
-    "models/gemini-1.5-flash-latest",
-    "models/gemini-1.5-flash-8b-latest"
+  const MODELS = ["models/gemini-flash-latest", "models/gemini-1.5-flash-latest", "models/gemini-1.5-flash-8b-latest"];
+
+  // Two attempts: first moderate token cap, then higher if MAX_TOKENS or empty output
+  const ATTEMPTS = [
+    { maxOutputTokens: 512, temperature: 0.4 },   // concise, stable
+    { maxOutputTokens: 1024, temperature: 0.3 },  // give extra room if first hit cap
   ];
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
+  const kill = setTimeout(() => controller.abort(), 20_000);
 
   try {
-    let lastErr = null;
+    let lastDiag = null;
 
     for (const base of BASES) {
       for (const model of MODELS) {
-        const url = `https://generativelanguage.googleapis.com/${base}/${model}:generateContent?key=${key}`;
-        const payload = {
-          contents: [
-            { role: "user", parts: [{ text: buildUserPrompt(prompt, langHint) }] }
-          ],
-          systemInstruction: { role: "system", parts: [{ text: systemInstruction }] },
-          generationConfig
-        };
+        for (const attempt of ATTEMPTS) {
+          const url = `https://generativelanguage.googleapis.com/${base}/${model}:generateContent?key=${key}`;
 
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        });
+          const payload = {
+            contents: [{ role: "user", parts: [{ text: userInstruction }]}],
+            systemInstruction: { role: "system", parts: [{ text: systemInstruction }] },
+            generationConfig: {
+              temperature: attempt.temperature,
+              maxOutputTokens: attempt.maxOutputTokens,
+              responseMimeType: "application/json",
+              // If your account supports response schema, uncomment the next block to enforce structure:
+              // responseSchema: {
+              //   type: "object",
+              //   properties: {
+              //     title: { type: "string" },
+              //     description: { type: "string" },
+              //     category: { type: "string" },
+              //     difficulty: { type: "string", enum: ["Easy","Medium","Advanced"] },
+              //     usefulness: { type: "integer" },
+              //     bonus: { type: "string" }
+              //   },
+              //   required: ["title","description","category","difficulty","usefulness","bonus"]
+              // }
+            }
+          };
 
-        const xHeaders = { "X-Gemini-Base": base, "X-Gemini-Model": model };
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          });
 
-        if (!resp.ok) {
-          lastErr = await resp.text().catch(() => "");
-          // If it's not a 404 model mismatch, return immediately
-          if (resp.status !== 404) {
-            clearTimeout(timer);
-            return withCORS(json({ error: `Gemini error: ${resp.status} ${lastErr}` }, resp.status), xHeaders);
+          const hdrs = { "X-Gemini-Base": base, "X-Gemini-Model": model, "X-Tokens-Target": String(attempt.maxOutputTokens) };
+
+          if (!resp.ok) {
+            lastDiag = { status: resp.status, text: await safeText(resp) };
+            // Return non-404 errors immediately; try next model for 404 only.
+            if (resp.status !== 404) {
+              clearTimeout(kill);
+              return withCORS(json({ error: `Gemini error: ${resp.status} ${lastDiag.text}` }, resp.status), hdrs);
+            }
+            continue; // try next model/base
           }
-          // else try next model/base
-          continue;
-        }
 
-        // Expect JSON because we forced responseMimeType
-        const dataText = await resp.text();
-        // If the upstream already returned JSON, forward it as-is
-        try {
-          const parsed = JSON.parse(dataText);
+          // We forced JSON mime type, but upstream may still return wrapper JSON.
+          const dataText = await safeText(resp);
 
-          // Common shapes:
-          // A) Direct JSON object (ideal, because we forced JSON)
-          // B) Wrapped in candidates[0].content.parts[0].text (stringified JSON)
-          // Normalize both cases:
+          // Try direct parse first
+          const parsed = safeJson(dataText);
 
-          // Case A: Already an object with fields
+          // If it's already the hack object, return it
           if (isHackShape(parsed)) {
-            clearTimeout(timer);
-            return withCORS(json(parsed, 200), xHeaders);
+            clearTimeout(kill);
+            return withCORS(json(parsed, 200), hdrs);
           }
 
-          // Case B: Safety: some responses still come as candidates/parts
-          const text =
+          // If it's a wrapper, try to pull the string text (some models embed JSON string there)
+          const candidateText =
             parsed?.candidates?.[0]?.content?.parts?.[0]?.text ??
-            parsed?.output_text ?? // future-proof
+            parsed?.output_text ??
             "";
 
-          if (typeof text === "string" && text.trim()) {
-            const inner = safeJsonExtract(text);
-            if (inner) {
-              clearTimeout(timer);
-              return withCORS(json(inner, 200), xHeaders);
+          // Extract JSON from candidate text if present
+          if (typeof candidateText === "string" && candidateText.trim()) {
+            const inner = extractJsonBlock(candidateText);
+            if (inner && isHackShape(inner)) {
+              clearTimeout(kill);
+              return withCORS(json(inner, 200), hdrs);
             }
           }
 
-          // If still nothing usable, return diagnostics
-          clearTimeout(timer);
-          return withCORS(
-            json(
-              {
-                error: "Model returned no usable JSON",
-                raw: parsed ?? dataText
-              },
-              200
-            ),
-            xHeaders
-          );
-        } catch (e) {
-          // Not valid JSON string (unexpected), return diagnostics
-          clearTimeout(timer);
-          return withCORS(
-            json(
-              {
-                error: "Upstream did not return valid JSON",
-                raw: dataText
-              },
-              200
-            ),
-            xHeaders
-          );
+          // If finishReason suggests MAX_TOKENS or no text, store diag and retry with higher cap
+          const finish = parsed?.candidates?.[0]?.finishReason || null;
+          const usage = parsed?.usageMetadata || null;
+          lastDiag = { finishReason: finish, usage };
+          if (finish === "MAX_TOKENS" || !candidateText) {
+            // Go to next attempt (higher tokens) or next model
+            continue;
+          }
+
+          // Otherwise, return diagnostics so the client can show a helpful message
+          clearTimeout(kill);
+          return withCORS(json({ error: "Model returned no usable JSON", raw: parsed }, 200), hdrs);
         }
       }
     }
 
-    clearTimeout(timer);
-    return withCORS(json({ error: `Gemini error: 404 ${lastErr || "No compatible model found."}` }, 404));
+    clearTimeout(kill);
+    return withCORS(json({ error: "No compatible model / no usable output", diag: lastDiag }, 502));
   } catch (e) {
-    clearTimeout(timer);
+    clearTimeout(kill);
     const isAbort = e?.name === "AbortError";
     return withCORS(json({ error: isAbort ? "Upstream timeout" : (e?.message || "Server error") }, isAbort ? 504 : 500));
   }
@@ -160,59 +146,52 @@ export default async function handler(req) {
 /* ---------------- helpers ---------------- */
 
 function buildUserPrompt(userPrompt, langHint) {
-  return `
-Output ONLY strict JSON with keys exactly:
-{
-  "title": "",
-  "description": "",
-  "category": "",
-  "difficulty": "Easy | Medium | Advanced",
-  "usefulness": 0,
-  "bonus": ""
-}
-
+  // Keep this super short to reduce prompt tokens
+  return `Return ONLY JSON with keys:
+{"title":"","description":"","category":"","difficulty":"Easy|Medium|Advanced","usefulness":0,"bonus":""}
 User prompt: ${userPrompt}
-Language hint: ${langHint}
-`.trim();
+Lang hint: ${langHint}`;
 }
 
-// Heuristic: does the object look like our hack?
 function isHackShape(o) {
   if (!o || typeof o !== "object") return false;
   const keys = ["title", "description", "category", "difficulty", "usefulness", "bonus"];
   return keys.every(k => Object.prototype.hasOwnProperty.call(o, k));
 }
 
-// Try to extract JSON from a string (if model returned JSON as text)
-function safeJsonExtract(text) {
-  // Remove ```json ... ``` fences
-  const fenced = text.match(/```(?:json)?\n([\s\S]*?)```/i);
-  const clean = (fenced ? fenced[1] : text).trim();
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
 
-  // Attempt direct parse
-  try {
-    const parsed = JSON.parse(clean);
-    if (isHackShape(parsed)) return parsed;
-  } catch {}
+async function safeText(resp) {
+  try { return await resp.text(); } catch { return ""; }
+}
 
-  // Try to find first {...} block
-  const start = clean.search(/[\{\[]/);
-  if (start !== -1) {
-    const open = clean[start];
-    const close = open === "{" ? "}" : "]";
-    let depth = 0;
-    for (let i = start; i < clean.length; i++) {
-      const ch = clean[i];
-      if (ch === open) depth++;
-      else if (ch === close) depth--;
-      if (depth === 0) {
-        const slice = clean.slice(start, i + 1);
-        try {
-          const parsed = JSON.parse(slice);
-          if (isHackShape(parsed)) return parsed;
-        } catch {}
-        break;
-      }
+// Extract a JSON object/array from a string (handles ```json fences too)
+function extractJsonBlock(s) {
+  if (!s || typeof s !== "string") return null;
+  const fenced = s.match(/```(?:json)?\n([\s\S]*?)```/i);
+  const t = (fenced ? fenced[1] : s).trim();
+
+  // Try direct parse
+  const direct = safeJson(t);
+  if (direct) return direct;
+
+  // Find first {...} or [...] block
+  const start = t.search(/[\{\[]/);
+  if (start === -1) return null;
+  const open = t[start];
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  for (let i = start; i < t.length; i++) {
+    const ch = t[i];
+    if (ch === open) depth++;
+    else if (ch === close) depth--;
+    if (depth === 0) {
+      const slice = t.slice(start, i + 1);
+      const obj = safeJson(slice);
+      if (obj) return obj;
+      break;
     }
   }
   return null;
@@ -225,11 +204,11 @@ function json(payload, status = 200) {
   });
 }
 
-function withCORS(res, extraHeaders = {}) {
+function withCORS(res, extra = {}) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
   h.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  for (const [k, v] of Object.entries(extraHeaders)) h.set(k, v);
+  for (const [k, v] of Object.entries(extra)) h.set(k, v);
   return new Response(res.body, { status: res.status, headers: h });
 }
