@@ -1,95 +1,97 @@
+// FILE: src/lib/generateHack.js
+
+import { stripJsonFences, detectLanguage, tryParseJson } from "./jsonUtils";
+
 /**
- * jsonUtils - small helpers for cleaning/parsing model JSON outputs
+ * Generate a hack by calling /api/hack (Edge Function).
  *
- * Functions:
- *  - stripJsonFences(text)     : removes ```json``` or ``` fenced code blocks and returns inner text
- *  - detectLanguage(text)      : basic language detector that returns 'mr' for Marathi (Devanagari) or 'en' otherwise
- *  - extractFirstJson(text)    : tries to find the first JSON object/array substring in the given text
- *  - tryParseJson(text)        : safe JSON.parse that returns object or throws
+ * @param {string} prompt
+ * @param {number} timeout   client-side timeout
  */
+export async function generateHack(prompt = "", timeout = 20000) {
+  const langHint = prompt ? detectLanguage(prompt) : "en";
 
-/**
- * Remove Markdown code fences (```json ... ``` or ``` ... ```) or single backtick blocks.
- * Returns a trimmed string.
- */
-export function stripJsonFences(text) {
-  if (!text || typeof text !== "string") return text;
-  // Remove triple backtick fences with optional "json"
-  const fenceMatch = text.match(/```(?:json)?\n([\s\S]*?)```/i);
-  if (fenceMatch && fenceMatch[1]) {
-    return fenceMatch[1].trim();
-  }
-  // Remove single-line code fences `...`
-  const single = text.replace(/`([^`]*)`/g, "$1");
-  return single.trim();
-}
-
-/**
- * Very small language detector:
- * - If the string contains Devanagari characters (U+0900–U+097F), assume Marathi ('mr')
- * - Otherwise default to English ('en')
- *
- * This is intentionally simple and works well for the Marathi vs English use-case.
- */
-export function detectLanguage(text) {
-  if (!text || typeof text !== "string") return "en";
-  // Devanagari unicode block: \u0900 - \u097F
-  const devanagari = /[\u0900-\u097F]/;
-  if (devanagari.test(text)) return "mr";
-  return "en";
-}
-
-/**
- * Attempt to find the first JSON object or array inside an arbitrary text blob.
- * Returns the substring (still as string) or null.
- */
-export function extractFirstJson(text) {
-  if (!text || typeof text !== "string") return null;
-
-  // Try to find a JSON object {...} or array [...] by scanning brackets.
-  // We'll look for the first '{' or '[' and attempt to greedily match until the corresponding close.
-  const startIdx = text.search(/[\{\[]/);
-  if (startIdx === -1) return null;
-
-  const openChar = text[startIdx];
-  const closeChar = openChar === "{" ? "}" : "]";
-  let depth = 0;
-  for (let i = startIdx; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === openChar) depth++;
-    else if (ch === closeChar) depth--;
-
-    if (depth === 0) {
-      const candidate = text.slice(startIdx, i + 1);
-      return candidate;
-    }
-  }
-  return null;
-}
-
-/**
- * Try to parse JSON from a string robustly.
- * - First attempts direct JSON.parse
- * - If that fails, attempts to extract first JSON substring and parse that
- * - Throws the original error if parsing ultimately fails
- */
-export function tryParseJson(str) {
-  if (typeof str !== "string") {
-    // If it's already an object, return as-is
-    return str;
-  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    return JSON.parse(str);
-  } catch (err) {
-    const extracted = extractFirstJson(str);
-    if (extracted) {
+    const response = await fetch("/api/hack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        prompt: prompt || "random useful hack for anyone",
+        langHint,
+      }),
+    });
+
+    clearTimeout(timer);
+
+    if (!response.ok) {
+      let err = null;
       try {
-        return JSON.parse(extracted);
-      } catch (err2) {
-        // fall through to throw original
-      }
+        err = await response.json();
+      } catch {}
+      throw new Error(err?.error || `HTTP ${response.status}`);
     }
+
+    const data = await response.json();
+
+    // Edge API returns: { title, description, ... } directly ✅
+    if (data.title) {
+      return normalizeHack(data);
+    }
+
+    // If somehow it returns {content: "...json..."}
+    const raw = data.content || data;
+    const cleaned = typeof raw === "string" ? stripJsonFences(raw) : raw;
+    const parsed = typeof cleaned === "string" ? tryParseJson(cleaned) : cleaned;
+
+    return normalizeHack(parsed);
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+    console.error("generateHack error:", err);
     throw err;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/* ---------- sanitize hack object ---------- */
+
+function normalizeHack(h) {
+  const obj = {
+    title: h.title || "",
+    description: h.description || "",
+    category: h.category || "misc",
+    difficulty: h.difficulty || "Easy",
+    usefulness: clamp(useNumber(h.usefulness), 0, 100),
+    bonus: h.bonus || "",
+  };
+
+  // cleanup
+  obj.title = String(obj.title).trim();
+  obj.description = String(obj.description).trim();
+  obj.category = String(obj.category).trim();
+  obj.bonus = String(obj.bonus).trim();
+
+  // difficulty
+  const d = obj.difficulty.toLowerCase();
+  if (d.includes("adv")) obj.difficulty = "Advanced";
+  else if (d.includes("med")) obj.difficulty = "Medium";
+  else obj.difficulty = "Easy";
+
+  return obj;
+}
+
+function useNumber(x) {
+  if (typeof x === "number") return x;
+  const m = String(x).match(/\d+/);
+  return m ? Number(m[0]) : 50;
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
