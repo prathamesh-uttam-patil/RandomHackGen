@@ -1,8 +1,5 @@
 // FILE: api/hack.js
-export const config = {
-  runtime: "edge",
-  // regions: ["bom1"], // optional; comment out if plan doesn't support region pinning
-};
+export const config = { runtime: "edge" };
 
 export default async function handler(req) {
   if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
@@ -17,92 +14,62 @@ export default async function handler(req) {
 
   const modelPrompt = buildPrompt(prompt, langHint);
 
+  // TRY ONLY VALID, CURRENT IDS — no plain "gemini-1.5-flash"
+  const BASES = ["v1beta", "v1"];
+  const MODELS = [
+    "models/gemini-1.5-flash-latest",
+    "models/gemini-1.5-flash-8b-latest",
+    "models/gemini-1.5-flash-001",
+    "models/gemini-1.5-flash-8b-001",
+  ];
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
 
   try {
-    // 1) Discover a valid model that supports generateContent
-    const discovery = await discoverModel(apiKey, controller.signal);
-    if (!discovery) {
-      clearTimeout(timer);
-      return cors(json({ error: "No compatible Gemini model found for generateContent." }, 404));
+    let lastErr = "";
+    for (const base of BASES) {
+      for (const model of MODELS) {
+        const url = `https://generativelanguage.googleapis.com/${base}/${model}:generateContent?key=${apiKey}`;
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: modelPrompt }] }],
+            generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
+          }),
+          signal: controller.signal,
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          const parsed = JSON.parse(extractJSON(text));
+          clearTimeout(timer);
+          return cors(json(parsed, 200), { "X-Gemini-Model": `${base}/${model}` });
+        } else {
+          lastErr = await resp.text();
+          // If it isn't a 404 (model not found), bail early
+          if (resp.status !== 404) {
+            clearTimeout(timer);
+            return cors(json({ error: `Gemini error: ${resp.status} ${lastErr}` }, resp.status), {
+              "X-Gemini-Model": `${base}/${model}`,
+            });
+          }
+        }
+      }
     }
-
-    const { base, modelName } = discovery; // base: "v1beta" or "v1"; modelName: "models/gemini-1.5-flash-latest" etc.
-    const url = `https://generativelanguage.googleapis.com/${base}/${modelName}:generateContent?key=${apiKey}`;
-
-    // 2) Call the chosen model
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: modelPrompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
-      }),
-      signal: controller.signal,
-    });
 
     clearTimeout(timer);
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      return cors(json({ error: `Gemini error: ${resp.status} ${errText}` }, resp.status), {
-        "X-Gemini-Model": modelName,
-      });
-    }
-
-    const data = await resp.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const parsed = JSON.parse(extractJSON(text));
-
-    return cors(json(parsed, 200), { "X-Gemini-Model": modelName });
+    return cors(json({ error: `Gemini error: 404 ${lastErr || "No compatible model found."}` }, 404));
   } catch (e) {
     clearTimeout(timer);
     const isAbort = e?.name === "AbortError";
-    return cors(
-      json({ error: isAbort ? "Upstream timeout" : (e?.message || "Server error") }, isAbort ? 504 : 500)
-    );
+    return cors(json({ error: isAbort ? "Upstream timeout" : (e?.message || "Server error") }, isAbort ? 504 : 500));
   }
 }
 
-/* ---------------- helpers ---------------- */
-
-async function discoverModel(apiKey, signal) {
-  // Try v1beta first, then v1
-  const bases = ["v1beta", "v1"];
-  for (const base of bases) {
-    const url = `https://generativelanguage.googleapis.com/${base}/models?key=${apiKey}`;
-    const r = await fetch(url, { signal });
-    if (!r.ok) continue;
-
-    const j = await r.json().catch(() => null);
-    const models = Array.isArray(j?.models) ? j.models : [];
-    // Keep only models that support generateContent
-    const usable = models.filter((m) =>
-      Array.isArray(m?.supportedGenerationMethods) &&
-      m.supportedGenerationMethods.includes("generateContent")
-    );
-
-    if (!usable.length) continue;
-
-    // Prefer flash (fast), 1.5, latest variants
-    usable.sort((a, b) => score(b) - score(a));
-    const best = usable[0];
-    if (best?.name) return { base, modelName: best.name };
-  }
-  return null;
-
-  function score(m) {
-    const n = String(m.name || "");
-    let s = 0;
-    if (n.includes("flash")) s += 5;
-    if (n.includes("1.5")) s += 3;
-    if (n.includes("latest")) s += 2;
-    if (n.includes("8b")) s += 1; // smaller, faster
-    return s;
-  }
-}
-
+/* helpers */
 function buildPrompt(userPrompt, langHint) {
   return `
 You generate a single clever, unique hack.
@@ -134,7 +101,6 @@ function json(payload, status = 200) {
     headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
 }
-
 function cors(res, extra = {}) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
