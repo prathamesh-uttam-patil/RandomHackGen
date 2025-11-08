@@ -5,8 +5,8 @@ export default async function handler(req) {
   if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
   if (req.method !== "POST") return cors(json({ error: "Method not allowed" }, 405));
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return cors(json({ error: "Missing GEMINI_API_KEY on server" }, 500));
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return cors(json({ error: "Missing GEMINI_API_KEY on server" }, 500));
 
   let body = {};
   try { body = await req.json(); } catch {}
@@ -14,54 +14,47 @@ export default async function handler(req) {
 
   const modelPrompt = buildPrompt(prompt, langHint);
 
-  // TRY ONLY VALID, CURRENT IDS — no plain "gemini-1.5-flash"
-  const BASES = ["v1beta", "v1"];
-  const MODELS = [
-    "models/gemini-1.5-flash-latest",
-    "models/gemini-1.5-flash-8b-latest",
-    "models/gemini-1.5-flash-001",
-    "models/gemini-1.5-flash-8b-001",
-  ];
-
+  // Abort after 20s
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
 
   try {
-    let lastErr = "";
-    for (const base of BASES) {
-      for (const model of MODELS) {
-        const url = `https://generativelanguage.googleapis.com/${base}/${model}:generateContent?key=${apiKey}`;
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: modelPrompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
-          }),
-          signal: controller.signal,
-        });
-
-        if (resp.ok) {
-          const data = await resp.json();
-          const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-          const parsed = JSON.parse(extractJSON(text));
-          clearTimeout(timer);
-          return cors(json(parsed, 200), { "X-Gemini-Model": `${base}/${model}` });
-        } else {
-          lastErr = await resp.text();
-          // If it isn't a 404 (model not found), bail early
-          if (resp.status !== 404) {
-            clearTimeout(timer);
-            return cors(json({ error: `Gemini error: ${resp.status} ${lastErr}` }, resp.status), {
-              "X-Gemini-Model": `${base}/${model}`,
-            });
-          }
-        }
-      }
+    // Discover a usable model for generateContent
+    const pick = await discoverUsableModel(key, controller.signal);
+    if (!pick) {
+      clearTimeout(timer);
+      return cors(json({ error: "No compatible Gemini model found for generateContent." }, 404));
     }
+    const { base, name } = pick; // e.g., base="v1beta", name="models/gemini-1.5-flash-latest"
+
+    const url = `https://generativelanguage.googleapis.com/${base}/${name}:generateContent?key=${key}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: modelPrompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 300 },
+      }),
+      signal: controller.signal,
+    });
 
     clearTimeout(timer);
-    return cors(json({ error: `Gemini error: 404 ${lastErr || "No compatible model found."}` }, 404));
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return cors(json({ error: `Gemini error: ${resp.status} ${errText}` }, resp.status), {
+        "X-Gemini-Base": base,
+        "X-Gemini-Model": name,
+      });
+    }
+
+    const data = await resp.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const parsed = JSON.parse(extractJSON(text) || "{}");
+    return cors(json(parsed, 200), {
+      "X-Gemini-Base": base,
+      "X-Gemini-Model": name,
+    });
   } catch (e) {
     clearTimeout(timer);
     const isAbort = e?.name === "AbortError";
@@ -69,7 +62,43 @@ export default async function handler(req) {
   }
 }
 
-/* helpers */
+/* ---------- helpers ---------- */
+
+async function discoverUsableModel(key, signal) {
+  const bases = ["v1beta", "v1"];
+  for (const base of bases) {
+    const url = `https://generativelanguage.googleapis.com/${base}/models?key=${key}`;
+    const r = await fetch(url, { signal });
+    if (!r.ok) continue;
+    const j = await r.json().catch(() => null);
+    const models = Array.isArray(j?.models) ? j.models : [];
+
+    // Keep only models that support generateContent
+    const usable = models.filter(
+      (m) => Array.isArray(m?.supportedGenerationMethods) &&
+             m.supportedGenerationMethods.includes("generateContent")
+    );
+
+    if (!usable.length) continue;
+
+    // Prefer fast flash variants; then 1.5; then latest; then 8b; finally anything
+    usable.sort((a, b) => score(b) - score(a));
+    const best = usable[0];
+    if (best?.name) return { base, name: best.name };
+  }
+  return null;
+
+  function score(m) {
+    const n = String(m?.name || "").toLowerCase();
+    let s = 0;
+    if (n.includes("flash")) s += 5;
+    if (n.includes("1.5")) s += 3;
+    if (n.includes("latest")) s += 2;
+    if (n.includes("8b")) s += 1;
+    return s;
+  }
+}
+
 function buildPrompt(userPrompt, langHint) {
   return `
 You generate a single clever, unique hack.
@@ -91,16 +120,17 @@ Language hint: ${langHint}
 }
 
 function extractJSON(s) {
-  const m = s.match(/```(?:json)?\n([\s\S]*?)```/i);
+  const m = typeof s === "string" && s.match(/```(?:json)?\n([\s\S]*?)```/i);
   return m ? m[1] : s;
 }
 
 function json(payload, status = 200) {
-  return new Response(JSON.stringify(payload), {
+  return new Response(JSON.stringify(payload, null, 2), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 }
+
 function cors(res, extra = {}) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
